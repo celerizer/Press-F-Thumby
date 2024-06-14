@@ -1,5 +1,7 @@
 # Press F Thumby
 
+https://github.com/celerizer/Press-F-Thumby/assets/33245078/f81acfcb-8bff-4878-9d88-d981f260120f
+
 ## Controls
 
 | Thumby         | Channel F                 |
