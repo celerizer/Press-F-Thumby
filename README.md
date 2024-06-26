@@ -28,3 +28,5 @@ https://github.com/celerizer/Press-F-Thumby/assets/33245078/f81acfcb-8bff-4878-9
 git clone https://github.com/celerizer/Press-F-Thumby.git --recurse-submodules
 ```
 - Open `Press-F-Thumby.ino` in Arduino IDE and flash the system.
+
+WARNING: Doing so will also overwrite the Thumby system firmware, erasing any games or save files that have not been backed up.
