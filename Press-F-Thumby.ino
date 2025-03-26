@@ -4,12 +4,11 @@ extern "C"
   #include "src/libpressf/src/input.h"
   #include "src/libpressf/src/hw/system.h"
   #include "src/libpressf/src/hw/vram.h"
+  #include "src/libpressf/src/rom_data.h"
   #include "src/libpressf/src/screen.h"
 }
 
-#include <thread>
-
-unsigned char bios_a[] = {
+const static unsigned char bios_a[] PROGMEM = {
   0x70, 0x0b, 0x70, 0x5c, 0x0a, 0x1f, 0x25, 0x40, 0x94, 0xf8, 0x67, 0x6b,
   0x20, 0x28, 0x5c, 0x2a, 0x08, 0x00, 0x16, 0x25, 0x55, 0x94, 0x04, 0x29,
   0x08, 0x02, 0x20, 0xd6, 0x53, 0x28, 0x00, 0xd0, 0x20, 0x4a, 0x50, 0x28,
@@ -99,7 +98,7 @@ unsigned char bios_a[] = {
 };
 unsigned int bios_a_size = 1024;
 
-unsigned char bios_b[] = {
+const static unsigned char bios_b[] PROGMEM = {
   0x04, 0x9c, 0x64, 0x6a, 0x41, 0x50, 0x25, 0x5c, 0x81, 0x07, 0x28, 0x04,
   0x3f, 0x20, 0x5c, 0x51, 0x41, 0x50, 0x25, 0x14, 0x91, 0x07, 0x28, 0x04,
   0x3f, 0x20, 0x14, 0x51, 0x6b, 0x42, 0x50, 0x25, 0x08, 0x91, 0x07, 0x28,
@@ -203,10 +202,101 @@ u16 vram[SCREEN_WIDTH * SCREEN_HEIGHT];
 #define PFT_CAMERA_X_MIN 0
 #define PFT_CAMERA_Y_MIN 0
 
+#define PFT_PACKET_MAGIC 0x506654
+
+enum
+{
+  PFT_PACKET_TYPE_NONE = 0,
+
+  /**
+   * Both systems continuously send this out on the ROM selection screen.
+   * On success, move to acknowledge.
+   */
+  PFT_PACKET_TYPE_BROADCAST,
+
+  /**
+   * Both systems send this out after receiving a broadcast signal.
+   * On success, do nothing until choose_game.
+   * On timeout, move to broadcasting.
+   */
+  PFT_PACKET_TYPE_ACKNOWLEDGE,
+
+  /**
+   * One system sends this out when a ROM is chosen, making that system
+   * the host.
+   * Data is CRC32 of selected ROM.
+   * On accept, start sending input frames.
+   * On deny, move to acknowledged state.
+   * On timeout, move to broadcasting state.
+   */
+  PFT_PACKET_TYPE_CHOOSE_GAME,
+
+  /**
+   * One system sends this out in response to a ROM being chosen, making
+   * that system the client. Only sent if the previous CRC32 belongs to a
+   * ROM in the client's catalog as well.
+   */
+  PFT_PACKET_TYPE_GAME_ACCEPT,
+
+  /**
+   * One system sends this out in response to a ROM being chosen.
+   * Only sent if the previous CRC32 does not belong to a ROM in the
+   * client's catalog.
+   */
+  PFT_PACKET_TYPE_GAME_DENY,
+
+  PFT_PACKET_TYPE_INPUT_FRAME,
+
+  PFT_PACKET_TYPE_SIZE
+};
+
+typedef struct
+{
+  struct
+  {
+    uint32_t magic : 24;
+    uint32_t type : 8;    
+  };
+  union
+  {
+    struct
+    {
+      uint32_t frame : 8;
+      uint32_t up : 1;
+      uint32_t down : 1;
+      uint32_t left : 1;
+      uint32_t right : 1;
+      uint32_t cw : 1;
+      uint32_t ccw : 1;
+      uint32_t pull : 1;
+      uint32_t plunge : 1;
+      uint32_t time : 1;
+      uint32_t mode : 1;
+      uint32_t hold : 1;
+      uint32_t start : 1;
+      uint32_t checksum : 12;
+    };
+    uint32_t data;
+  };
+} pft_packet_t;
+
+enum
+{
+  PFT_LINK_NONE = 0,
+
+  PFT_LINK_HOST,
+  PFT_LINK_CLIENT,
+
+  PFT_LINK_SIZE
+};
+
 typedef struct pft_t
 {
   unsigned camera_x = PFT_CAMERA_X_DEFAULT;
   unsigned camera_y = PFT_CAMERA_Y_DEFAULT;
+  uint8_t link_state = PFT_LINK_NONE;
+  uint8_t frames = 0;
+  pft_packet_t last_received_packet;
 } pft_t;
 
 static pft_t pft;
@@ -260,6 +350,7 @@ void setup()
 {
   /* Display a boot screen, though should boot fast enough to not be seen */
   thumby.begin();
+  thumby.clear();
   thumby.setCursor(4, 4);
   thumby.print("Press F");
   thumby.setCursor(4, 12);
@@ -267,44 +358,110 @@ void setup()
   thumby.writeBuffer(thumby.getBuffer(), thumby.getBufferSize());
   
   /* Initialize the system and load the ROMs */
-  memset(&f8_system, 0, sizeof(f8_system_t));
   pressf_init(&f8_system);
   f8_system_init(&f8_system, &pf_systems[0]);
   f8_write(&f8_system, 0x0000, bios_a, 0x0400);
   f8_write(&f8_system, 0x0400, bios_b, 0x0400);
 
-  /* Register custom implementation for beeper callback */
-  for (int i = 0; i < f8_system.f8device_count; i++)
+  int cursor = 0;
+  bool prev_up = false;
+  bool prev_down = false;
+  
+  while (1)
   {
-    if (f8_system.io_ports[i].device_out &&
-        f8_system.io_ports[i].device_out->type == F8_DEVICE_BEEPER)
-      f8_system.io_ports[i].func_out = sound_out;          
+    thumby.clear();
+
+    if (thumby.isPressed(BUTTON_U))
+    {
+      if (!prev_up && cursor > 0)
+        cursor--;
+      prev_up = true;
+    }
+    else
+      prev_up = false;
+
+    if (thumby.isPressed(BUTTON_D))
+    {
+      if (!prev_down && cursor < 64)
+        cursor++;
+      prev_down = true;
+    }
+    else
+      prev_down = false;
+
+    if (thumby.isPressed(BUTTON_A))
+      break;
+    else if (thumby.isPressed(BUTTON_B))
+    {
+      cursor = -1;
+      break;
+    }
+    
+    for (int i = 0; i < 5; i++)
+    {
+      if (cursor + i >= 64)
+        break;
+      thumby.setCursor(0, i * 8);
+      thumby.print(i == 0 ? ">" : " ");
+      thumby.print(pf_roms[cursor + i].name);
+    }
+    thumby.writeBuffer(thumby.getBuffer(), thumby.getBufferSize());
   }
+
+  /* Load ROM if one was selected */
+  if (cursor > -1)
+    for (unsigned i = 0; i < pf_roms[cursor].size; i += 0x0400)
+      f8_write(&f8_system, 0x0800 + i, &pf_roms[cursor].data[i], 0x0400);
+
+  /* Register custom implementation for beeper callback */
+  f8_system_set_device_out_cb(&f8_system, F8_DEVICE_BEEPER, sound_out);
 }
 
 void loop()
 {
-  if (!thumby.isPressed(BUTTON_A) && thumby.isPressed(BUTTON_B))
+  set_input_button(0, INPUT_TIME, thumby.isPressed(BUTTON_L) & thumby.isPressed(BUTTON_B));
+  set_input_button(0, INPUT_MODE, thumby.isPressed(BUTTON_R) & thumby.isPressed(BUTTON_B));
+  set_input_button(0, INPUT_HOLD, thumby.isPressed(BUTTON_D) & thumby.isPressed(BUTTON_B));
+  set_input_button(0, INPUT_START, thumby.isPressed(BUTTON_U) & thumby.isPressed(BUTTON_B));
+ 
+  set_input_button(4, INPUT_ROTATE_CCW, thumby.isPressed(BUTTON_L) & thumby.isPressed(BUTTON_A));
+  set_input_button(4, INPUT_ROTATE_CW, thumby.isPressed(BUTTON_R) & thumby.isPressed(BUTTON_A));
+  set_input_button(4, INPUT_PULL, thumby.isPressed(BUTTON_U) & thumby.isPressed(BUTTON_A));
+  set_input_button(4, INPUT_PUSH, thumby.isPressed(BUTTON_D) & thumby.isPressed(BUTTON_A));
+
+  set_input_button(4, INPUT_RIGHT, thumby.isPressed(BUTTON_R) & !(thumby.isPressed(BUTTON_A) || thumby.isPressed(BUTTON_B)));
+  set_input_button(4, INPUT_LEFT, thumby.isPressed(BUTTON_L) & !(thumby.isPressed(BUTTON_A) || thumby.isPressed(BUTTON_B)));
+  set_input_button(4, INPUT_BACK, thumby.isPressed(BUTTON_D) & !(thumby.isPressed(BUTTON_A) || thumby.isPressed(BUTTON_B)));
+  set_input_button(4, INPUT_FORWARD, thumby.isPressed(BUTTON_U) & !(thumby.isPressed(BUTTON_A) || thumby.isPressed(BUTTON_B)));
+
+  if (pft.link_state == PFT_LINK_NONE)
   {
-    set_input_button(0, INPUT_TIME, thumby.isPressed(BUTTON_L));
-    set_input_button(0, INPUT_MODE, thumby.isPressed(BUTTON_R));
-    set_input_button(0, INPUT_HOLD, thumby.isPressed(BUTTON_D));
-    set_input_button(0, INPUT_START, thumby.isPressed(BUTTON_U));
+    set_input_button(1, INPUT_ROTATE_CCW, 0);
+    set_input_button(1, INPUT_ROTATE_CW, 0);
+    set_input_button(1, INPUT_PULL, 0);
+    set_input_button(1, INPUT_PUSH, 0);
+    set_input_button(1, INPUT_RIGHT, 0);
+    set_input_button(1, INPUT_LEFT, 0);
+    set_input_button(1, INPUT_BACK, 0);
+    set_input_button(1, INPUT_FORWARD, 0);
   }
-  else if (thumby.isPressed(BUTTON_A) && !thumby.isPressed(BUTTON_B))
+  else
   {
-    set_input_button(4, INPUT_ROTATE_CCW, thumby.isPressed(BUTTON_L));
-    set_input_button(4, INPUT_ROTATE_CW, thumby.isPressed(BUTTON_R));
-    set_input_button(4, INPUT_PULL, thumby.isPressed(BUTTON_U));
-    set_input_button(4, INPUT_PUSH, thumby.isPressed(BUTTON_D));
+    if (pft.last_received_packet.type == PFT_PACKET_TYPE_INPUT_FRAME &&
+        pft.last_received_packet.frame == pft.frames)
+    {
+      set_input_button(1, INPUT_ROTATE_CCW, pft.last_received_packet.ccw);
+      set_input_button(1, INPUT_ROTATE_CW, 0);
+      set_input_button(1, INPUT_PULL, 0);
+      set_input_button(1, INPUT_PUSH, 0);
+      set_input_button(1, INPUT_RIGHT, 0);
+      set_input_button(1, INPUT_LEFT, 0);
+      set_input_button(1, INPUT_BACK, 0);
+      set_input_button(1, INPUT_FORWARD, 0);
+    }
   }
-  else if (!thumby.isPressed(BUTTON_A) && !thumby.isPressed(BUTTON_B))
-  {
-    set_input_button(4, INPUT_RIGHT, thumby.isPressed(BUTTON_R));
-    set_input_button(4, INPUT_LEFT, thumby.isPressed(BUTTON_L));
-    set_input_button(4, INPUT_BACK, thumby.isPressed(BUTTON_D));
-    set_input_button(4, INPUT_FORWARD, thumby.isPressed(BUTTON_U));
-  }
+    
   pressf_run(&f8_system);
+  pft.frames++;
   pft_draw();
 }
